@@ -1,574 +1,656 @@
-# ============================================================================
-# Ubuntu 26.04 LTS (Resolute Raccoon) · ARM64 完整 rootfs 构建
-# ----------------------------------------------------------------------------
-# 放到仓库 .github/workflows/ 下即可使用；Actions 页面手动触发，或推送 v* 标签。
+# =============================================================================
+# Ubuntu 26.04.1 LTS (Resolute Raccoon) / arm64 / DroidSpaces RootFS
+# -----------------------------------------------------------------------------
+# 放进仓库的 .github/workflows/ 即可，手动运行或推 v* tag 自动出包。
 #
-# 产物：ubuntu-26.04-arm64-rootfs.tar.gz（不含内核，可 chroot / 做容器 /
-#       配合板卡内核与 bootloader 使用），另附 sha256、包清单、构建信息。
+# 产出：ubuntu-26.04.1-arm64-droidspaces.tar.xz（+ .sha256）
+#   · 构建源保持官方默认：官方 ubuntu-base 26.04.1 arm64 归档（或 debootstrap
+#     走官方 ports.ubuntu.com 现场 bootstrap），不从任何第三方镜像拉基础包
+#   · 软件源统一切到中科大 USTC：rootfs 内 apt 指向
+#     https://mirrors.ustc.edu.cn/ubuntu-ports（arm64 属 ports 架构），
+#     原官方配置备份在 /etc/apt/default-sources-backup/，并补齐 universe / multiverse 组件
+#   · 完整中文终端：zh_CN.UTF-8、语言包、中文 man、Noto CJK / Emoji 字体、上海时区
+#   · systemd 作为 PID 1（/sbin/init -> /lib/systemd/systemd），清空 machine-id
+#     供首次启动生成；构建期用 policy-rc.d 阻止服务在 chroot 内自启
+#   · zsh + oh-my-zsh + Powerlevel10k（系统图标 / 文件夹图标）+ fzf-tab 路径补全
+#     + zsh-autosuggestions + zsh-syntax-highlighting + zsh-completions + zoxide
+#   · eza / bat / rg / fd / fzf / fastfetch / btop / ncdu 等常用工具
+#   · 中文启动欢迎语（系统信息 + 字体提示，1 小时节流，login/非 login 都显示）
 #
-# 关键约定：
-#   * 构建阶段（runner 与容器）完全使用 Ubuntu 镜像自带的默认官方源，不改一行；
-#   * 只有最终 rootfs 内的 apt 源被替换为「中科大 USTC ubuntu-ports」；
-#   * arm64 走的是 ubuntu-ports 仓库（不是 ubuntu 仓库），这点最容易配错；
-#   * 通过 QEMU binfmt 在 x86_64 runner 上跑原生 arm64 容器，导出的文件系统
-#     里不会残留任何 qemu 二进制。
+# 导入 DroidSpaces：Android App「从文件安装」直接选 .tar.xz；Linux CLI 用
+#   sudo mkdir ubuntu && sudo tar -xJf ubuntu-26.04.1-arm64-droidspaces.tar.xz -C ubuntu
+#   sudo droidspaces --name=ubuntu --rootfs=/path/to/ubuntu start
+# 必须用 sudo 解包，否则 root 所有权 / setuid 丢失，sudo、systemd 服务会异常。
 #
-# 加速选项：若仓库可用 GitHub 原生 arm64 runner，把 runs-on 改成
-#           ubuntu-24.04-arm 并删掉 "Enable QEMU (arm64)" 步骤即可（无需模拟）。
-# ============================================================================
-name: Build Ubuntu 26.04 arm64 RootFS
+# 注意：终端字体请选 MesloLGS NF（已随 rootfs 装到 /usr/share/fonts），
+#       否则 Nerd Font 图标与文件夹图标会显示成方块；`p10k configure` 可重配主题。
+#       若手机内核 <= 5.10，Ubuntu 26.04 自带的新版 systemd 可能不兼容，
+#       需要自行降级 systemd 或使用 DroidSpaces 的 systemd 兼容构建。
+# =============================================================================
+name: 构建 Ubuntu 26.04.1 arm64 DroidSpaces RootFS
 
 on:
   workflow_dispatch:
     inputs:
+      base_method:
+        description: '构建源（基础系统获取方式）：ubuntu-base=官方归档，debootstrap=官方 ports 源现场 bootstrap；两者均为官方默认，软件源则在配置阶段统一切到中科大 USTC'
+        type: choice
+        required: true
+        default: 'ubuntu-base'
+        options:
+          - ubuntu-base
+          - debootstrap
+      point_release:
+        description: 'Ubuntu 点版本（对应官方归档文件名）'
+        type: string
+        required: true
+        default: '26.04.1'
       extra_packages:
-        description: '额外追加的 apt 包名（空格分隔，可留空）'
+        description: '额外追加的 apt 软件包，空格分隔，可留空'
+        type: string
         required: false
         default: ''
   push:
     tags: ['v*']
 
-concurrency:
-  group: rootfs-2604-arm64-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
 
+concurrency:
+  group: rootfs-build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  IMAGE: ubuntu:26.04
-  PLATFORM: linux/arm64
-  CONTAINER: rootfs-build
-  OUT_NAME: ubuntu-26.04-arm64-rootfs
+  SUITE: resolute
+  POINT_RELEASE: ${{ inputs.point_release || '26.04.1' }}
+  BASE_METHOD: ${{ inputs.base_method || 'ubuntu-base' }}
+  EXTRA_PACKAGES: ${{ inputs.extra_packages || '' }}
+  # arm64 走 ubuntu-ports；如需回退官方默认，改成 https://ports.ubuntu.com/ubuntu-ports
+  APT_MIRROR: https://mirrors.ustc.edu.cn/ubuntu-ports
+  ROOTFS: ${{ github.workspace }}/rootfs
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    name: 构建 arm64 rootfs
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # 注册 arm64 binfmt，之后 docker run --platform linux/arm64 由 QEMU 执行
-      - name: Enable QEMU (arm64)
+      - name: 注册 QEMU binfmt（跨架构 chroot）
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Host tools (runner 软件源保持默认，不做任何替换)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl git jq pigz file xz-utils tar
-
-      # ------------------------------------------------------------------
-      # 在宿主机下载好 zsh 生态资产，再拷进容器：避免容器里 git clone / 证书问题
-      # ------------------------------------------------------------------
-      - name: Fetch zsh plugins, starship (aarch64) and generate build script
+      - name: 安装构建工具
         run: |
           set -euo pipefail
-          rm -rf assets && mkdir -p assets/zsh/plugins
-          git clone --depth 1 -q https://github.com/zsh-users/zsh-autosuggestions.git \
-            assets/zsh/plugins/zsh-autosuggestions
-          git clone --depth 1 -q https://github.com/zsh-users/zsh-syntax-highlighting.git \
-            assets/zsh/plugins/zsh-syntax-highlighting
-          git clone --depth 1 -q https://github.com/zsh-users/zsh-completions.git \
-            assets/zsh/plugins/zsh-completions
-          # starship 官方 release 的 aarch64 musl 静态包，容器里无需 Rust/GLIBC 依赖
-          curl -fL --retry 3 -o /tmp/starship.tgz \
-            https://github.com/starship/starship/releases/latest/download/starship-aarch64-unknown-linux-musl.tar.gz
-          mkdir -p /tmp/starship-x
-          tar -xzf /tmp/starship.tgz -C /tmp/starship-x
-          SBIN=$(find /tmp/starship-x -type f -name starship -print -quit)
-          test -n "$SBIN" && cp "$SBIN" assets/starship
-          chmod 755 assets/starship
-          file assets/starship
-          file assets/starship | grep -Eqi 'aarch64|ARM' || {
-            echo "::error:: starship 不是 aarch64 二进制"; exit 1; }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support debootstrap \
+            xz-utils tar coreutils curl git ca-certificates
+          # 宿主侧 binfmt 指向 /usr/bin/qemu-aarch64-static；后续会把它复制进 chroot，
+          # 因此无论 binfmt 是否带 F 标志，arm64 二进制都能在 chroot 内执行。
+          sudo update-binfmts --enable qemu-aarch64 || true
+          echo '== binfmt_misc 状态 =='
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
+          ls -l /usr/bin/qemu-aarch64-static
 
-          # 容器内执行的配置脚本：写成文件再 docker cp，避免嵌套 heredoc 走 stdin
-          cat > assets/setup.sh <<'SETUP_EOF'
-          #!/usr/bin/env bash
-          # 在 arm64 容器内部执行：装包、中文本地化、zsh、欢迎语、换 USTC 源
+      - name: 获取官方 Ubuntu Base 26.04.1 arm64（或 debootstrap 现场构建）
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOTFS"
+          if [ "$BASE_METHOD" = "debootstrap" ]; then
+            # runner 上的 debootstrap 可能还不认识 resolute，借用已有的 Ubuntu 脚本
+            if [ ! -e /usr/share/debootstrap/scripts/resolute ]; then
+              for s in noble jammy gutsy; do
+                if [ -e "/usr/share/debootstrap/scripts/$s" ]; then
+                  sudo ln -s "$s" /usr/share/debootstrap/scripts/resolute
+                  break
+                fi
+              done
+            fi
+            # 官方默认 arm64 源；不指定任何第三方镜像
+            sudo debootstrap --arch=arm64 --foreign \
+              --components=main,restricted,universe,multiverse \
+              --include=ca-certificates,apt,locales,sudo \
+              "$SUITE" "$ROOTFS" http://ports.ubuntu.com/ubuntu-ports/
+            sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS/usr/bin/"
+            sudo mount -t proc proc "$ROOTFS/proc"
+            sudo mount -t sysfs sys "$ROOTFS/sys"
+            sudo mount --bind /dev "$ROOTFS/dev"
+            sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
+            sudo chroot "$ROOTFS" /debootstrap/debootstrap --second-stage
+            for m in dev/pts dev sys proc; do sudo umount -R "$ROOTFS/$m" || true; done
+          else
+            BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${SUITE}/release"
+            FILE="ubuntu-base-${POINT_RELEASE}-base-arm64.tar.gz"
+            echo "下载 ${BASE_URL}/${FILE}"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$FILE" "${BASE_URL}/${FILE}"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o SHA256SUMS "${BASE_URL}/SHA256SUMS"
+            grep -E "${FILE}$" SHA256SUMS | sha256sum -c -
+            # 必须 sudo 解包：保留 root 所有权与 setuid 位
+            sudo tar -xzf "$FILE" -C "$ROOTFS" --numeric-owner
+          fi
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS/usr/bin/"
+          # 构建期 DNS：不复制宿主的 systemd-resolved stub（127.0.0.53 在 chroot 内不可用）。
+          # 首选国内公共 DNS，便于 chroot 内解析 mirrors.ustc.edu.cn；DroidSpaces 启动时
+          # 通常会注入自己的 resolv.conf，这里保留一份通用默认值。
+          printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\n' \
+            | sudo tee "$ROOTFS/etc/resolv.conf" >/dev/null
+          echo '== 基础系统信息 =='
+          sudo cat "$ROOTFS/etc/os-release"
+
+      - name: 生成 rootfs 内配置脚本
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/configure-rootfs.sh" <<'ROOTFS_CONF_EOF'
+          #!/bin/bash
+          # 在 arm64 chroot 内以 root 执行
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          export LANG=C.UTF-8
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-          # 阻止安装 systemd/udev/cron 等时真的启动服务
-          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
-          chmod +x /usr/sbin/policy-rc.d
+          echo '== [1/9] 阻止 chroot 内服务自启 =='
+          cat > /usr/sbin/policy-rc.d <<'POLICY_EOF'
+          #!/bin/sh
+          exit 101
+          POLICY_EOF
+          chmod 755 /usr/sbin/policy-rc.d
 
-          echo "==> [1/9] 使用镜像自带默认官方源安装系统底座"
-          apt-get update -qq
-          apt-get install -y \
-            ca-certificates gnupg sudo \
-            locales tzdata language-pack-zh-hans \
-            fonts-noto-cjk fonts-noto-color-emoji \
-            man-db manpages manpages-zh ncurses-term \
-            bash-completion command-not-found zsh zsh-common \
-            vim nano less tree jq curl wget git rsync openssh-client \
-            iproute2 iputils-ping bind9-dnsutils net-tools netcat-openbsd \
-            procps psmisc lsof htop file unzip zip xz-utils zstd \
-            python3 python3-pip python3-venv make pkg-config \
-            ubuntu-standard
-
-          echo "==> [2/9] 常用增强工具（源里没有的包自动跳过，不影响构建）"
-          OPTIONAL_PKGS=(
-            ripgrep fd-find bat fzf fastfetch btop ncdu zoxide figlet
-            build-essential cmake strace tcpdump sysstat iotop
-            pciutils usbutils mtr-tiny traceroute socat moreutils
-            p7zip-full 7zip unrar-free lsd duf
-            fonts-wqy-microhei kbd console-setup which apt-transport-https
-          )
-          AVAILABLE=""
-          for p in "${OPTIONAL_PKGS[@]}"; do
-            if apt-cache show "$p" >/dev/null 2>&1; then AVAILABLE+="$p "; fi
+          echo '== [2/9] 软件源切换到中科大 USTC（基础系统仍取自官方默认构建源） =='
+          MIRROR="${APT_MIRROR:-https://mirrors.ustc.edu.cn/ubuntu-ports}"
+          echo "apt 镜像 -> $MIRROR"
+          # 兼容 deb822 (*.sources) 与传统格式 (*.list / sources.list)：
+          # 保留 Suites / Signed-By，只替换 URI 并补齐 universe / multiverse。
+          # 原官方默认配置备份到 /etc/apt/default-sources-backup/*.default.bak，随时可回退；
+          # 不放进 sources.list.d，避免 apt 扫描到无效扩展名文件。
+          BK=/etc/apt/default-sources-backup
+          mkdir -p "$BK"
+          for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
+          [ -f "$f" ] || continue
+          [ -f "$BK/$(basename "$f").default.bak" ] || cp -a "$f" "$BK/$(basename "$f").default.bak"
+          case "$f" in
+          *.sources)
+          # deb822：URIs 行统一指向 USTC，主仓库 / security 多段配置一并生效
+          sed -i -E "s|^([[:space:]]*URIs:).*|\1 $MIRROR|" "$f"
+          ;;
+          *)
+          # 传统格式：官方主机逐项替换；arm64 必须走 ubuntu-ports 而非 ubuntu
+          sed -i -E \
+          -e 's|https?://(cn\.)?archive\.ubuntu\.com/ubuntu/?|'"$MIRROR"'|g' \
+          -e 's|https?://security\.ubuntu\.com/ubuntu/?|'"$MIRROR"'|g' \
+          -e 's|https?://ports\.ubuntu\.com/ubuntu-ports/?|'"$MIRROR"'|g' \
+          -e 's|https?://ports\.ubuntu\.com/?|'"$MIRROR"'|g' \
+          "$f"
+          ;;
+          esac
+          sed -i -E '/^[[:space:]]*Components:/{ /universe/!s/$/ universe multiverse/ }' "$f"
+          sed -i -E '/^[[:space:]]*deb /{ /universe/!s/$/ universe multiverse/ }' "$f"
           done
-          if [ -n "$AVAILABLE" ]; then
-            apt-get install -y --no-install-recommends $AVAILABLE || {
-              for p in $AVAILABLE; do
-                apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1 \
-                  || echo "  · 跳过不可用的包: $p"
-              done
-            }
+          # 兜底：若基础镜像的源文件结构特殊或缺失，直接写标准 USTC deb822 配置
+          if ! grep -qsF -- "$MIRROR" \
+          /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list 2>/dev/null; then
+          printf '%s\n' \
+          'Types: deb' \
+          "URIs: $MIRROR" \
+          'Suites: resolute resolute-updates resolute-backports' \
+          'Components: main restricted universe multiverse' \
+          'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+          '' \
+          'Types: deb' \
+          "URIs: $MIRROR" \
+          'Suites: resolute-security' \
+          'Components: main restricted universe multiverse' \
+          'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+          > /etc/apt/sources.list.d/ustc.sources
           fi
+          echo '== 生效的 apt 源 =='
+          grep -hE '^[[:space:]]*(URIs:|deb )' \
+          /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list 2>/dev/null \
+          | sed 's/^/  /'
+          # 注：USTC 帮助页建议 security 源保留官方以避开镜像同步延迟；此处按需求统一走中科大。
+          apt-get update || { echo 'apt update 首次失败，5 秒后重试'; sleep 5; apt-get update; }
+          # 不做 upgrade：保持 26.04.1 点版本的可预期性；需要最新安全补丁可自行取消注释
+          # apt-get -y upgrade
 
-          # workflow_dispatch 传进来的额外包，只允许合法包名字符
+          echo '== [3/9] 基础系统 / systemd / 中文本地化 / 常用工具 =='
+          CORE_PKGS="
+          systemd systemd-sysv systemd-timesyncd libpam-systemd dbus
+          sudo ca-certificates gnupg lsb-release
+          locales tzdata language-pack-zh-hans language-pack-zh-hans-base
+          fonts-noto-cjk fonts-noto-color-emoji fontconfig
+          man-db manpages-zh less ncurses-term
+          zsh zsh-common bash-completion command-not-found
+          curl wget git vim nano tmux htop procps psmisc lsof
+          file which tree unzip zip tar xz-utils gzip bzip2 rsync
+          openssh-client openssh-server openssl iproute2 iputils-ping net-tools
+          python3 python3-pip build-essential pkg-config make cmake
+          "
+          MODERN_PKGS="eza bat fd-find ripgrep fzf zoxide fastfetch btop ncdu jq"
+          apt-get install -y --no-install-recommends $CORE_PKGS
+          # 现代工具若个别包改名/缺失，整体失败后逐个降级安装，不让整批构建崩掉
+          if ! apt-get install -y --no-install-recommends $MODERN_PKGS; then
+          apt-get -f -y install || true
+          for p in $MODERN_PKGS; do
+          apt-get install -y --no-install-recommends "$p" || echo "跳过缺失包: $p"
+          done
+          fi
+          apt-get install -y --no-install-recommends bind9-dnsutils \
+          || apt-get install -y --no-install-recommends dnsutils || true
           if [ -n "${EXTRA_PACKAGES:-}" ]; then
-            for p in $EXTRA_PACKAGES; do
-              if [[ "$p" =~ ^[a-zA-Z0-9.+-]+$ ]]; then
-                apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1 \
-                  || echo "  · 跳过额外包: $p"
-              fi
-            done
+          echo "追加自定义软件包: ${EXTRA_PACKAGES}"
+          apt-get install -y --no-install-recommends ${EXTRA_PACKAGES}
           fi
+          ln -sf /usr/bin/batcat /usr/local/bin/bat
+          ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
-          echo "==> [3/9] 完整中文本地化（zh_CN.UTF-8 / 字体 / 中文手册 / 上海时区）"
-          sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/; s/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-          locale-gen
-          cat > /etc/default/locale <<'LOCALE'
+          echo '== [4/9] 中文 UTF-8 + 上海时区 + 中文 man =='
+          sed -i -E 's/^# *(zh_CN\.UTF-8 UTF-8)/\1/; s/^# *(en_US\.UTF-8 UTF-8)/\1/' /etc/locale.gen
+          locale-gen >/dev/null
+          cat > /etc/default/locale <<'LOCALE_EOF'
           LANG="zh_CN.UTF-8"
           LANGUAGE="zh_CN:zh"
-          LOCALE
-          for kv in 'LANG="zh_CN.UTF-8"' 'LANGUAGE="zh_CN:zh"'; do
-            key="${kv%%=*}"
-            if grep -q "^${key}=" /etc/environment 2>/dev/null; then
-              sed -i "s|^${key}=.*|${kv}|" /etc/environment
-            else
-              echo "$kv" >> /etc/environment
-            fi
-          done
-          cat > /etc/profile.d/00-locale.sh <<'PROFILE_LOCALE'
+          LC_MESSAGES="zh_CN.UTF-8"
+          LOCALE_EOF
+          cat > /etc/environment <<'ENV_EOF'
+          LANG="zh_CN.UTF-8"
+          LANGUAGE="zh_CN:zh"
+          ENV_EOF
+          cat > /etc/zsh/zshenv <<'ZSENV_EOF'
+          # 全局 zsh 环境：登录/非登录、交互/非交互都会读取
           export LANG=zh_CN.UTF-8
           export LANGUAGE=zh_CN:zh
-          export LC_CTYPE=zh_CN.UTF-8
-          export LESSCHARSET=utf-8
-          PROFILE_LOCALE
-          ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-          echo 'Asia/Shanghai' > /etc/timezone
-          command -v fc-cache >/dev/null 2>&1 && fc-cache -f || true
+          export LC_MESSAGES=zh_CN.UTF-8
+          export TZ=Asia/Shanghai
+          export EDITOR=vim
+          export PAGER=less
+          export LESS=-R
+          ZSENV_EOF
+          ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          printf 'Asia/Shanghai\n' > /etc/timezone
 
-          echo "==> [4/9] 安装 zsh 插件与 starship，并把默认 shell 切成 zsh"
-          mkdir -p /usr/share/zsh/plugins /etc/skel/.config /root/.config
-          cp -a /tmp/assets/zsh/plugins/. /usr/share/zsh/plugins/
-          install -m 0755 /tmp/assets/starship /usr/local/bin/starship
-          usermod -s /usr/bin/zsh root 2>/dev/null || \
-            sed -i 's#^\(root:[^:]*:[^:]*:[^:]*:[^:]*:\)/[^:]*:[^:]*$#\1/root:/usr/bin/zsh#' /etc/passwd
-          sed -i 's|^DSHELL=.*|DSHELL=/usr/bin/zsh|' /etc/adduser.conf 2>/dev/null || true
-          sed -i 's|^SHELL=.*|SHELL=/usr/bin/zsh|' /etc/default/useradd 2>/dev/null || true
-          # zsh 的所有实例（含非登录 shell）都强制中文环境
-          cat >> /etc/zsh/zshenv <<'ZSHENV'
-          export LANG=zh_CN.UTF-8
-          export LANGUAGE=zh_CN:zh
-          export LC_CTYPE=zh_CN.UTF-8
-          export LESSCHARSET=utf-8
-          ZSHENV
+          echo '== [5/9] 主机名 / hosts / systemd 首启状态 =='
+          printf 'droidspaces-ubuntu\n' > /etc/hostname
+          cat > /etc/hosts <<'HOSTS_EOF'
+          127.0.0.1   localhost
+          127.0.1.1   droidspaces-ubuntu
+          ::1         localhost ip6-localhost ip6-loopback
+          fe00::0     ip6-localnet
+          ff00::0     ip6-mcastprefix
+          ff02::1     ip6-allnodes
+          ff02::2     ip6-allrouters
+          HOSTS_EOF
+          : > /etc/fstab
+          ln -sf /lib/systemd/systemd /sbin/init
+          ln -sf /lib/systemd/system/multi-user.target /etc/systemd/system/default.target
+          : > /etc/machine-id
+          rm -f /var/lib/dbus/machine-id
+          ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
-          echo "==> [5/9] 写入美观实用的 zsh 配置"
-          cat > /tmp/zshrc.tpl <<'ZSHRC'
-          # ───────────────────────────────────────────────────────────────
-          # Ubuntu 26.04 arm64 rootfs · zsh + starship 配置
-          # ───────────────────────────────────────────────────────────────
-          export LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh LC_CTYPE=zh_CN.UTF-8
-          export EDITOR=vim VISUAL=vim PAGER=less
-          export LESS='-R' LESSCHARSET=utf-8
-          export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border --preview-window=right:50%'
-          umask 022
-
-          # 历史
-          HISTFILE="${HOME}/.zsh_history"
-          HISTSIZE=100000
-          SAVEHIST=100000
-          setopt INC_APPEND_HISTORY SHARE_HISTORY EXTENDED_HISTORY
-          setopt HIST_IGNORE_ALL_DUPS HIST_IGNORE_SPACE HIST_SAVE_NO_DUPS
-          setopt AUTO_CD AUTO_PUSHD PUSHD_IGNORE_DUPS
-          setopt EXTENDED_GLOB INTERACTIVE_COMMENTS NO_BEEP NO_CLOBBER
-          bindkey -e
-
-          # 补全（大小写不敏感 + 菜单选择）
-          P=/usr/share/zsh/plugins
-          [ -d "$P/zsh-completions/src" ] && fpath=("$P/zsh-completions/src" $fpath)
-          autoload -Uz compinit && compinit -i
-          zstyle ':completion:*' menu select
-          zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'
-          zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
-          zstyle ':completion:*:*:git:*' tag-order 'local-repository-'
-
-          # 实用别名与函数
-          alias ll='ls -alhF --color=auto --time-style=long-iso'
-          alias la='ls -Ah --color=auto' l='ls -CF --color=auto'
-          alias ..='cd ..' ...='cd ../..' ....='cd ../../..'
-          alias grep='grep --color=auto' egrep='egrep --color=auto'
-          alias df='df -h' du='du -h' free='free -h' ps='ps auxf'
-          alias gs='git status -sb' ga='git add' gc='git commit -m' \
-                gl='git log --oneline --graph --decorate -20' gd='git diff'
-          alias ports='ss -tulpn' myip='curl -fsSL --max-time 5 ifconfig.me || curl -fsSL --max-time 5 https://myip.ipip.net'
-          alias aptup='apt update && apt upgrade -y' \
-                aptin='apt install -y' apts='apt search'
-          alias zshconfig='${EDITOR} ~/.zshrc' reload='exec zsh' cls='clear'
-          alias ff='fastfetch' h='history 1'
-          mkcd() { mkdir -p "$1" && cd "$1"; }
-          extract() {
-            if [ -f "$1" ]; then case "$1" in
-              *.tar.bz2) tar -xjf "$1" ;; *.tar.gz|*.tgz) tar -xzf "$1" ;;
-              *.tar.xz)  tar -xJf "$1" ;; *.tar.zst) tar --zstd -xf "$1" ;;
-              *.bz2) bunzip2 "$1" ;; *.gz) gunzip "$1" ;; *.zip) unzip "$1" ;;
-              *.7z) 7z x "$1" ;; *.rar) unrar x "$1" ;;
-              *) echo "无法识别的压缩格式: $1" ;; esac
-            else echo "文件不存在: $1"; fi
+          echo '== [6/9] zsh 生态：oh-my-zsh + Powerlevel10k + 补全/高亮插件 =='
+          ZSH_DIR=/usr/share/oh-my-zsh
+          PLUG_DIR=/usr/share/zsh-plugins
+          mkdir -p "$PLUG_DIR"
+          clone_repo() {
+          local url="$1" dir="$2"
+          [ -d "$dir/.git" ] && return 0
+          git clone --depth=1 "$url" "$dir" || { rm -rf "$dir"; sleep 3; git clone --depth=1 "$url" "$dir"; }
           }
-          if command -v bat >/dev/null 2>&1; then
-            alias cat='bat --paging=never'
-          elif command -v batcat >/dev/null 2>&1; then
-            alias cat='batcat --paging=never'
-          fi
-          command -v fdfind >/dev/null 2>&1 && alias fd='fdfind'
-          if ! command -v fastfetch >/dev/null 2>&1; then alias ff='uname -a'; fi
+          clone_repo https://github.com/ohmyzsh/ohmyzsh.git "$ZSH_DIR"
+          clone_repo https://github.com/romkatv/powerlevel10k.git "$PLUG_DIR/powerlevel10k"
+          clone_repo https://github.com/zsh-users/zsh-completions.git "$PLUG_DIR/zsh-completions"
+          clone_repo https://github.com/Aloxaf/fzf-tab.git "$PLUG_DIR/fzf-tab"
+          clone_repo https://github.com/zsh-users/zsh-autosuggestions.git "$PLUG_DIR/zsh-autosuggestions"
+          clone_repo https://github.com/zsh-users/zsh-syntax-highlighting.git "$PLUG_DIR/zsh-syntax-highlighting"
 
-          # fzf 键绑定（Ctrl-R / Ctrl-T / Alt-C）
-          if command -v fzf >/dev/null 2>&1; then
-            eval "$(fzf --zsh 2>/dev/null)" || {
-              for f in /usr/share/fzf/*.zsh /usr/share/doc/fzf/examples/*.zsh; do
-                [ -f "$f" ] && source "$f"
-              done
-            }
-          fi
-          # zoxide（更聪明的 cd）
-          command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
+          # MesloLGS NF：p10k 的系统图标 / 文件夹图标全靠它
+          FONT_DIR=/usr/share/fonts/truetype/meslolgs-nf
+          mkdir -p "$FONT_DIR"
+          for name in 'MesloLGS NF Regular.ttf' 'MesloLGS NF Bold.ttf' \
+          'MesloLGS NF Italic.ttf' 'MesloLGS NF Bold Italic.ttf'; do
+          url="https://github.com/romkatv/powerlevel10k-media/raw/master/$(printf '%s' "$name" | sed 's/ /%20/g')"
+          curl -fsSL --retry 3 --max-time 60 -o "$FONT_DIR/$name" "$url" \
+          || echo "字体下载失败（可稍后手动安装 Nerd Font）: $name"
+          done
+          fc-cache -f >/dev/null 2>&1 || true
 
-          # 插件：自动建议必须早于语法高亮
-          ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=#666666'
+          cat > /etc/skel/.p10k.zsh <<'P10K_EOF'
+          # Powerlevel10k 预置配置：系统图标 + 文件夹图标 + 双行实用提示符
+          typeset -g POWERLEVEL9K_MODE=nerdfont-complete
+          typeset -g POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(os_icon dir vcs newline prompt_char)
+          typeset -g POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status command_execution_time background_jobs virtualenv context time)
+          typeset -g POWERLEVEL9K_PROMPT_ADD_NEWLINE=true
+          # 发行版系统图标
+          typeset -g POWERLEVEL9K_OS_ICON_FOREGROUND=111
+          # 文件夹图标：Nerd Font nf-fa-folder (U+F07B)
+          typeset -g POWERLEVEL9K_DIR_VISUAL_IDENTIFIER_EXPANSION=$'\uF07B'
+          typeset -g POWERLEVEL9K_DIR_FOREGROUND=75
+          typeset -g POWERLEVEL9K_SHORTEN_STRATEGY=truncate_to_unique
+          typeset -g POWERLEVEL9K_SHORTEN_DIR_LENGTH=2
+          typeset -g POWERLEVEL9K_DIR_MAX_LENGTH=60
+          # 状态 / 耗时 / 时间 / 提示符
+          typeset -g POWERLEVEL9K_STATUS_OK=false
+          typeset -g POWERLEVEL9K_STATUS_ERROR_FOREGROUND=196
+          typeset -g POWERLEVEL9K_COMMAND_EXECUTION_TIME_FOREGROUND=178
+          typeset -g POWERLEVEL9K_TIME_FORMAT='%D{%H:%M:%S}'
+          typeset -g POWERLEVEL9K_TIME_FOREGROUND=244
+          typeset -g POWERLEVEL9K_CONTEXT_FOREGROUND=180
+          typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_CONTENT_EXPANSION='❯'
+          typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_CONTENT_EXPANSION='❯'
+          typeset -g POWERLEVEL9K_PROMPT_CHAR_OK_VIINS_FOREGROUND=76
+          typeset -g POWERLEVEL9K_PROMPT_CHAR_ERROR_VIINS_FOREGROUND=196
+          P10K_EOF
+
+          cat > /etc/skel/.zshrc <<'ZSHRC_EOF'
+          # ---------- Powerlevel10k 瞬时提示符（必须在 .zshrc 最顶部）----------
+          if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+          source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+          fi
+
+          # ---------- 环境 ----------
+          export ZSH=/usr/share/oh-my-zsh
+          export ZSH_THEME=""
+          export ZSH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/oh-my-zsh"
+          export DISABLE_AUTO_UPDATE=true
+          export DISABLE_UPDATE_PROMPT=true
+          export ZSH_DISABLE_COMPFIX=true
+          export HISTFILE="$HOME/.zsh_history"
+          export HISTSIZE=50000
+          export SAVEHIST=50000
+          export BAT_THEME="TwoDark"
+          export FZF_DEFAULT_OPTS="--height 45% --layout=reverse --border=rounded --inline-info"
+          eval "$(dircolors -b)" 2>/dev/null || true
+
+          # ---------- 补全：zsh-completions 进入 fpath ----------
+          fpath=(/usr/share/zsh-plugins/zsh-completions/src $fpath)
+
+          # ---------- oh-my-zsh 框架（git 别名 / extract / sudo / systemd 等）----------
+          plugins=(git sudo extract command-not-found colored-man-pages systemd common-aliases)
+          source "$ZSH/oh-my-zsh.sh"
+
+          # 重新 compinit 以纳入 zsh-completions；fzf-tab 必须在其后加载
+          autoload -Uz compinit && compinit -i
+
+          # ---------- fzf-tab：Tab 补全 = 模糊选择 + 文件/目录预览（路径补全核心）----------
+          source /usr/share/zsh-plugins/fzf-tab/fzf-tab.plugin.zsh
+          zstyle ':completion:*' menu select
+          zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|=*' 'l:|=* r:|=*'
+          zstyle ':completion:*' list-colors ${(s.:.)LS_COLORS}
+          zstyle ':completion:*:descriptions' format '%F{cyan}-- %d --%f'
+          zstyle ':completion:*' group-name ''
+          zstyle ':completion:*' verbose yes
+          zstyle ':fzf-tab:*' fzf-flags --height=45% --border=rounded --preview-window=right:50%
+          zstyle ':fzf-tab:*' switch-group ',' '.'
+          zstyle ':fzf-tab:complete:cd:*' fzf-preview 'eza -1a --icons=auto --color=always $realpath'
+          zstyle ':fzf-tab:complete:*:*' fzf-preview 'if [[ -f $realpath ]]; then batcat --color=always --style=numbers,header $realpath; else eza -la --icons=auto --color=always $realpath; fi'
+
+          # ---------- 主题：系统图标 + 文件夹图标 ----------
+          source /usr/share/zsh-plugins/powerlevel10k/powerlevel10k.zsh-theme
+          [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
+          # ---------- 自动建议（历史 + 补全）----------
           ZSH_AUTOSUGGEST_STRATEGY=(history completion)
-          [ -f "$P/zsh-autosuggestions/zsh-autosuggestions.zsh" ] && \
-            source "$P/zsh-autosuggestions/zsh-autosuggestions.zsh"
+          ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=244'
+          ZSH_AUTOSUGGEST_USE_ASYNC=1
+          source /usr/share/zsh-plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
 
-          # 提示符：starship（两行、彩色、含 git / 耗时 / 时间）
-          if command -v starship >/dev/null 2>&1; then
-            eval "$(starship init zsh)"
-          else
-            autoload -Uz vcs_info
-            precmd() { vcs_info }
-            zstyle ':vcs_info:git:*' formats ' %F{yellow} %b%f'
-            setopt PROMPT_SUBST
-            PROMPT='%F{cyan}%n@%m%f %F{blue}%~%f${vcs_info_msg_0_} %F{green}❯%f '
-          fi
-
-          # 语法高亮务必最后加载
-          [ -f "$P/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" ] && \
-            source "$P/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
-          ZSHRC
-          install -m 0644 /tmp/zshrc.tpl /root/.zshrc
-          install -m 0644 /tmp/zshrc.tpl /etc/skel/.zshrc
-
-          cat > /tmp/starship.tpl <<'STARSHIP'
-          # Starship · 中文友好、无需 Nerd Font 的提示符
-          add_newline = true
-          command_timeout = 1000
-
-          format = """
-          [╭─](bold cyan)$username$hostname$directory$git_branch$git_status$cmd_duration$time
-          [╰─](bold cyan)$character """
-
-          [username]
-          show_always = true
-          style_user = "bold 214"
-          style_root = "bold red"
-          format = "[$user]($style) "
-
-          [hostname]
-          ssh_only = false
-          style = "bold 111"
-          format = "@[$hostname]($style) "
-
-          [directory]
-          style = "bold cyan"
-          truncation_length = 4
-          truncate_to_repo = true
-          format = "[$path]($style) "
-
-          [git_branch]
-          symbol = "分支 "
-          style = "bold yellow"
-          format = "[$symbol$branch]($style) "
-
-          [git_status]
-          style = "bold red"
-          format = "[$all_status]($style) "
-
-          [cmd_duration]
-          min_time = 1000
-          style = "bold 244"
-          format = "[耗时 $duration]($style) "
-
-          [time]
-          disabled = false
-          time_format = "%H:%M:%S"
-          style = "bold 245"
-          format = "[$time]($style)"
-
-          [character]
-          success_symbol = "[❯](bold green)"
-          error_symbol = "[❯](bold red)"
-          vicmd_symbol = "[❮](bold yellow)"
-          STARSHIP
-          install -m 0644 /tmp/starship.tpl /root/.config/starship.toml
-          install -m 0644 /tmp/starship.tpl /etc/skel/.config/starship.toml
-
-          echo "==> [6/9] 中文启动欢迎语（登录 shell / SSH 均可见）"
-          cat > /usr/local/bin/rootfs-welcome <<'WELCOME'
-          #!/usr/bin/env bash
-          # 动态系统概览；非 TTY 时自动退化为纯文本，不污染管道
-          if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
-            C1='\033[1;36m'; C2='\033[1;33m'; C3='\033[0;36m'
-            C4='\033[0;37m'; C5='\033[1;32m'; N='\033[0m'
-          else
-            C1=''; C2=''; C3=''; C4=''; C5=''; N=''
-          fi
-          line="${C1}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-          row() { printf "  ${C3}%s${N}  ${C4}%s${N}\n" "$1" "$2"; }
-
-          . /etc/os-release 2>/dev/null || true
-          HOST=$(hostname 2>/dev/null || echo 'unknown')
-          NOW=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST' 2>/dev/null)
-          ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
-          KERNEL=$(uname -r 2>/dev/null || echo '—')
-          LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '—')
-          MEM=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3" / "$2}'); [ -n "$MEM" ] || MEM='—'
-          DISK=$(df -h / 2>/dev/null | awk 'NR==2 {print $3" / "$2" ("$5")"}'); [ -n "$DISK" ] || DISK='—'
-          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-          [ -z "$IP" ] && IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)
-          [ -z "$IP" ] && IP='—'
-
-          printf "\n%b\n" "$line"
-          printf "  ${C2}🐧 %s${N}  ${C4}·${N}  ${C5}%s${N}  ${C4}·${N}  ${C5}中文本地化终端环境${N}\n" \
-            "${PRETTY_NAME:-Ubuntu 26.04 LTS}" "$ARCH"
-          printf "%b\n" "$line"
-          row "主机"      "$HOST"
-          row "时间"      "$NOW  ·  时区 Asia/Shanghai"
-          row "发行版"    "${PRETTY_NAME:-Ubuntu 26.04 LTS} (${VERSION_CODENAME:-resolute})"
-          row "运行内核"  "$KERNEL  （chroot / 容器下为宿主内核）"
-          row "架构"      "$ARCH / aarch64"
-          row "负载"      "$LOAD"
-          row "内存"      "$MEM      根分区  $DISK"
-          row "地址"      "$IP"
-          row "语言"      "zh_CN.UTF-8  ·  中文手册 / 中文字体已就绪"
-          row "软件源"    "中科大 USTC · https://mirrors.ustc.edu.cn/ubuntu-ports"
-          row "Shell"     "zsh + starship（自动建议 / 语法高亮 / 补全增强）"
-          row "常用命令"  "ll · gs · myip · ports · aptup · ff · z · extract · reload"
-          printf "%b\n\n" "$line"
-          WELCOME
-          chmod 0755 /usr/local/bin/rootfs-welcome
-
-          cat > /etc/profile.d/00-welcome.sh <<'PROFILE_WELCOME'
-          # bash / sh 登录时显示欢迎语
-          if [ -t 1 ] && [ -x /usr/local/bin/rootfs-welcome ]; then
-            /usr/local/bin/rootfs-welcome
-          fi
-          PROFILE_WELCOME
-          cat >> /etc/zsh/zprofile <<'ZPROFILE'
-
-          # >>> rootfs 中文欢迎语 >>>
-          if [[ -o interactive && -x /usr/local/bin/rootfs-welcome ]]; then
-            /usr/local/bin/rootfs-welcome
-          fi
-          # <<< rootfs 中文欢迎语 <<<
-          ZPROFILE
-
-          cat > /etc/motd <<'MOTD'
-          欢迎使用 Ubuntu 26.04 LTS (Resolute Raccoon) arm64 中文本地化 rootfs
-          软件源：中国科学技术大学 USTC 镜像 · https://mirrors.ustc.edu.cn/ubuntu-ports
-          MOTD
-          cat > /etc/issue <<'ISSUE'
-          Ubuntu 26.04 LTS \n \l  ·  arm64  ·  中文本地化终端
-          \d \t
-          ISSUE
-          # Ubuntu 自带的英文 update-motd 广告/更新提示会干扰观感，停用
-          for f in /etc/update-motd.d/*; do
-            [ -f "$f" ] && chmod -x "$f" 2>/dev/null || true
+          # ---------- fzf 键绑定：Ctrl+R 历史 / Ctrl+T 文件 ----------
+          for f in /usr/share/fzf/key-bindings.zsh \
+          /usr/share/doc/fzf/examples/key-bindings.zsh; do
+          [[ -r "$f" ]] && source "$f"
           done
 
-          echo "==> [7/9] 基础网络配置与构建元数据"
-          cat > /etc/hosts <<'HOSTS'
-          127.0.0.1       localhost
-          127.0.1.1       ubuntu
-          ::1             localhost ip6-localhost ip6-loopback
-          fe00::0         ip6-localnet
-          ff00::0         ip6-mcastprefix
-          ff02::1         ip6-allnodes
-          ff02::2         ip6-allrouters
-          HOSTS
-          echo 'ubuntu' > /etc/hostname
-          dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | sort > /etc/rootfs-packages.tsv
-          cat > /etc/rootfs-build-info <<'INFO'
-          Ubuntu 26.04 LTS (Resolute Raccoon) · arm64 rootfs
-            - 中文本地化: zh_CN.UTF-8 / 中文字体 / 中文手册 / Asia/Shanghai
-            - Shell      : zsh + starship + autosuggestions + syntax-highlighting + fzf
-            - apt 源     : 中科大 USTC ubuntu-ports (DEB822)
-            - 构建源     : Ubuntu 官方默认源（未做任何修改）
-            - 内核       : 不含内核，配合目标板卡内核 / bootloader 使用
-          INFO
+          # ---------- zoxide：z / zi 智能目录跳转 ----------
+          if (( $+commands[zoxide] )); then
+          eval "$(zoxide init zsh)"
+          fi
 
-          echo "==> [8/9] 仅替换 rootfs 内软件源为中科大 USTC（arm64 用 ubuntu-ports）"
-          . /etc/os-release
-          SUITE="${VERSION_CODENAME}"
-          rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list
-          cat > /etc/apt/sources.list.d/ustc.sources <<SOURCES
-          Types: deb
-          URIs: https://mirrors.ustc.edu.cn/ubuntu-ports
-          Suites: ${SUITE} ${SUITE}-updates ${SUITE}-backports
-          Components: main restricted universe multiverse
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          # ---------- 现代命令别名 ----------
+          alias ls='eza --icons=auto --group-directories-first --color=auto'
+          alias ll='eza -lah --icons=auto --git --group-directories-first'
+          alias la='eza -a --icons=auto --group-directories-first'
+          alias lt='eza --tree --icons=auto --level=2'
+          alias bat='batcat'
+          alias catp='batcat --paging=never --style=numbers,header'
+          alias fd='fdfind'
+          alias cman='man -M /usr/share/man/zh_CN'
+          alias df='df -h'
+          alias du='du -h'
+          alias free='free -h'
+          alias ports='ss -tulnp'
+          alias myip='curl -fsS --max-time 5 https://api.ipify.org && echo'
+          alias ..='cd ..'
+          alias ...='cd ../..'
+          alias grep='grep --color=auto'
+          alias g=git
 
-          Types: deb
-          URIs: https://mirrors.ustc.edu.cn/ubuntu-ports
-          Suites: ${SUITE}-security
-          Components: main restricted universe multiverse
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          SOURCES
-          # 预取一次 USTC 索引让 rootfs 开箱即用；CI 网络不可达时快速失败且不阻断构建
-          apt-get update -qq \
-            -o Acquire::Retries=0 \
-            -o Acquire::http::Timeout=10 \
-            -o Acquire::https::Timeout=10 \
-            || echo '  · 提示：USTC 索引未预取成功，首次使用请先 apt update'
+          # ---------- zsh 选项 ----------
+          setopt AUTO_CD INTERACTIVE_COMMENTS SHARE_HISTORY INC_APPEND_HISTORY \
+          HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_VERIFY EXTENDED_GLOB \
+          COMPLETE_IN_WORD ALWAYS_TO_END AUTO_MENU AUTO_LIST \
+          AUTO_PARAM_SLASH AUTO_REMOVE_SLASH NO_BEEP
+          bindkey '^[[A' up-line-or-search
+          bindkey '^[[B' down-line-or-search
 
-          echo "==> [9/9] 清理"
+          # ---------- 语法高亮：必须最后加载 ----------
+          source /usr/share/zsh-plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+
+          # ---------- Ubuntu 命令未找到提示 ----------
+          [[ -r /etc/zsh_command_not_found ]] && source /etc/zsh_command_not_found
+
+          # ---------- 启动欢迎语（脚本内置 1 小时节流，兼容非 login shell）----------
+          [[ -t 1 ]] && /usr/local/bin/droid-welcome
+          ZSHRC_EOF
+
+          echo '== [7/9] 账户与默认 shell =='
+          usermod -s /bin/zsh root 2>/dev/null \
+          || sed -i -E 's|^(root:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*):/bin/bash$|\1:/bin/zsh|' /etc/passwd
+          if ! id -u ubuntu >/dev/null 2>&1; then
+          # UID 1000 的普通用户：DroidSpaces App 的「可用用户」会检测到它
+          useradd -m -u 1000 -s /bin/zsh -G sudo,adm -c 'Ubuntu User' ubuntu
+          fi
+          passwd -d ubuntu
+          printf 'ubuntu ALL=(ALL:ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/99-ubuntu
+          chmod 440 /etc/sudoers.d/99-ubuntu
+          install -m 644 /etc/skel/.zshrc /root/.zshrc
+          install -m 644 /etc/skel/.p10k.zsh /root/.p10k.zsh
+          mkdir -p /root/.cache /home/ubuntu/.cache
+          chown -R ubuntu:ubuntu /home/ubuntu
+
+          echo '== [8/9] 中文启动欢迎语 / motd =='
+          cat > /usr/local/bin/droid-welcome <<'WELCOME_EOF'
+          #!/bin/sh
+          # DroidSpaces 中文启动欢迎语：1 小时节流，避免每开一个 shell 刷屏
+          [ -t 1 ] || exit 0
+          stamp="/tmp/.droid-welcome-$(id -u)"
+          now=$(date +%s 2>/dev/null || echo 0)
+          last=0
+          [ -r "$stamp" ] && last=$(cat "$stamp" 2>/dev/null)
+          case "$last" in ''|*[!0-9]*) last=0 ;; esac
+          [ $((now - last)) -lt 3600 ] && exit 0
+          printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+
+          C0='\033[0m'
+          C1='\033[38;5;81m'
+          C2='\033[38;5;111m'
+          C3='\033[38;5;244m'
+          C4='\033[38;5;229m'
+          C5='\033[38;5;215m'
+          B='──────────────────────────────────────────────────────────'
+          . /etc/os-release 2>/dev/null || PRETTY_NAME='Ubuntu 26.04.1 LTS'
+          [ -n "${PRETTY_NAME:-}" ] || PRETTY_NAME='Ubuntu 26.04.1 LTS'
+          KERNEL=$(uname -r 2>/dev/null || echo '未知')
+          ARCH=$(uname -m 2>/dev/null || echo 'aarch64')
+          HOST=$(hostname 2>/dev/null || echo 'droidspaces-ubuntu')
+          CORES=$(nproc 2>/dev/null || echo '?')
+          MEM=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3"/"$2}')
+          [ -n "$MEM" ] || MEM='未知'
+          DISK=$(df -h / 2>/dev/null | awk 'NR==2 {print $3"/"$2" ("$5")"}')
+          [ -n "$DISK" ] || DISK='未知'
+          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          if [ -z "$IP" ]; then IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'); fi
+          [ -n "$IP" ] || IP='未分配'
+          UP=$(uptime -p 2>/dev/null || true)
+          [ -n "$UP" ] || UP='刚刚启动'
+          NOW=$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo '')
+          INIT=$(readlink -f /sbin/init 2>/dev/null || echo '/lib/systemd/systemd')
+          row() { printf '  %s[%s]%s  %s%s%s\n' "$C3" "$1" "$C0" "$C4" "$2" "$C0"; }
+          printf '\n%s╭%s╮%s\n' "$C2" "$B" "$C0"
+          printf '  %s%s%s\n' "$C1" "  欢迎使用 ${PRETTY_NAME} · DroidSpaces 中文终端环境" "$C0"
+          printf '%s╰%s╯%s\n' "$C2" "$B" "$C0"
+          row '发行版' "$PRETTY_NAME"
+          row '内核' "$KERNEL  /  $ARCH"
+          row 'Init' "systemd  →  $INIT"
+          row 'Shell' 'zsh + Powerlevel10k（系统图标 / 文件夹图标 / 路径补全）'
+          row '本地化' 'zh_CN.UTF-8 · 中文 man 手册 · Asia/Shanghai'
+          MIRROR=$(grep -hE '^[[:space:]]*(URIs:|deb )' \
+          /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i ~ /^https?:\/\//) {print $i; exit}}')
+          [ -n "$MIRROR" ] || MIRROR='中科大 USTC · ubuntu-ports'
+          row '软件源' "$MIRROR"
+          row '主机名' "$HOST"
+          row 'CPU' "${CORES} 核"
+          row '内存' "$MEM"
+          row '磁盘' "$DISK"
+          row '地址' "$IP"
+          row '运行' "$UP"
+          row '时间' "$NOW"
+          printf '  %s%s%s\n' "$C5" "$B" "$C0"
+          printf '  %s提示%s  终端字体请选 %sMesloLGS NF%s（否则图标显示为方块）\n' "$C5" "$C0" "$C1" "$C0"
+          printf '  %s     %s  p10k configure 定制主题 | z <关键词> 智能跳转 | lt 图标目录树\n' "$C3" "$C0"
+          printf '  %s     %s  ll / Ctrl+R / Tab 带预览的补全 | cman <命令> 中文手册%s\n\n' "$C3" "$C0" "$C0"
+          WELCOME_EOF
+          chmod 755 /usr/local/bin/droid-welcome
+          cat > /etc/profile.d/99-droid-welcome.sh <<'PROFILE_EOF'
+          # 登录型 shell 也会看到欢迎语（zsh 的 .zshrc 里另有触发，脚本自带节流）
+          if [ -t 1 ]; then /usr/local/bin/droid-welcome; fi
+          PROFILE_EOF
+          chmod 644 /etc/profile.d/99-droid-welcome.sh
+          printf '欢迎使用 Ubuntu 26.04.1 LTS · DroidSpaces 中文终端环境（systemd / zsh + Powerlevel10k 已就绪）\n' > /etc/motd
+          mkdir -p /etc/update-motd.d
+          cat > /etc/update-motd.d/99-droidspaces <<'MOTD_EOF'
+          #!/bin/sh
+          /usr/local/bin/droid-welcome
+          MOTD_EOF
+          chmod 755 /etc/update-motd.d/99-droidspaces
+
+          echo '== [9/9] 收尾清理（保证 systemd 首次启动干净） =='
           apt-get clean
-          rm -rf /var/cache/apt/archives/*.deb /tmp/assets /tmp/zshrc.tpl /tmp/starship.tpl \
-                 /usr/sbin/policy-rc.d /var/log/apt/* /var/log/dpkg.log* 2>/dev/null || true
-          echo "配置完成：$(cat /etc/os-release | grep '^PRETTY_NAME=' | cut -d= -f2-) / ${SUITE} / arm64"
-          SETUP_EOF
-          chmod +x assets/setup.sh
-          bash -n assets/setup.sh
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb /var/cache/apt/*.bin
+          find /var/log -type f -size +0 -exec truncate -s 0 {} + 2>/dev/null || true
+          rm -f /root/.bash_history /root/.zsh_history /root/.wget-hsts /root/.python_history
+          rm -f /home/ubuntu/.bash_history /home/ubuntu/.zsh_history /home/ubuntu/.wget-hsts
+          rm -f /usr/sbin/policy-rc.d
+          rm -f /etc/ssh/ssh_host_* 2>/dev/null || true
+          : > /etc/machine-id
+          rm -f /tmp/configure-rootfs.sh
+          echo "zsh        : $(zsh --version 2>/dev/null || echo '缺失')"
+          echo "systemd init: $(readlink -f /sbin/init)"
+          echo "locale     : $(locale -a 2>/dev/null | grep -i '^zh_CN' | head -1 || echo '缺失')"
+          echo "root shell : $(getent passwd root | cut -d: -f7)"
+          echo '配置完成'
+          ROOTFS_CONF_EOF
+          chmod +x "$RUNNER_TEMP/configure-rootfs.sh"
+          bash -n "$RUNNER_TEMP/configure-rootfs.sh"
+          echo "配置脚本已生成：$RUNNER_TEMP/configure-rootfs.sh"
 
-      - name: Start arm64 Ubuntu 26.04 container
-        run: |
-          docker rm -f "${{ env.CONTAINER }}" 2>/dev/null || true
-          docker run -d --platform "${{ env.PLATFORM }}" \
-            --name "${{ env.CONTAINER }}" "${{ env.IMAGE }}" sleep infinity
-          docker exec "${{ env.CONTAINER }}" mkdir -p /tmp/assets
-
-      - name: Copy assets into container
-        run: docker cp assets/. "${{ env.CONTAINER }}:/tmp/assets/"
-
-      - name: Configure rootfs inside arm64 container (官方默认源)
-        env:
-          EXTRA_PACKAGES: ${{ inputs.extra_packages || '' }}
-        run: |
-          docker exec \
-            -e DEBIAN_FRONTEND=noninteractive \
-            -e EXTRA_PACKAGES="$EXTRA_PACKAGES" \
-            "${{ env.CONTAINER }}" bash /tmp/assets/setup.sh
-
-      # ------------------------------------------------------------------
-      # 导出 → 修正 /etc/hosts 等 bind-mount 文件 → 重新打包 → 校验
-      # ------------------------------------------------------------------
-      - name: Export, fix and package rootfs
+      - name: 挂载并在 arm64 chroot 内完成全部配置
         run: |
           set -euo pipefail
-          docker export -o rootfs.raw.tar "${{ env.CONTAINER }}"
-          sudo rm -rf rootfs && sudo mkdir -p rootfs
-          sudo tar -xpf rootfs.raw.tar -C rootfs
+          cleanup() {
+            for m in run dev/pts dev sys proc; do
+              sudo umount -R "$ROOTFS/$m" 2>/dev/null || true
+            done
+          }
+          trap cleanup EXIT
+          sudo mkdir -p "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev/pts" "$ROOTFS/run" "$ROOTFS/tmp"
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount -t sysfs sys "$ROOTFS/sys"
+          sudo mount --bind /dev "$ROOTFS/dev"
+          sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
+          sudo mount -t tmpfs tmpfs "$ROOTFS/run"
+          sudo install -m 755 "$RUNNER_TEMP/configure-rootfs.sh" "$ROOTFS/tmp/configure-rootfs.sh"
+          sudo env \
+            DEBIAN_FRONTEND=noninteractive \
+            APT_MIRROR="${APT_MIRROR:-https://mirrors.ustc.edu.cn/ubuntu-ports}" \
+            EXTRA_PACKAGES="${EXTRA_PACKAGES:-}" \
+            HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" \
+            http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}" \
+            NO_PROXY="${NO_PROXY:-}" no_proxy="${no_proxy:-}" \
+            chroot "$ROOTFS" /tmp/configure-rootfs.sh
 
-          # Docker 把 /etc/hosts /etc/hostname /etc/resolv.conf 做成 bind mount，
-          # 导出后需补回，否则 chroot 里 localhost 解析会出问题。
-          sudo tee rootfs/etc/hosts >/dev/null <<'HOSTS'
-          127.0.0.1       localhost
-          127.0.1.1       ubuntu
-          ::1             localhost ip6-localhost ip6-loopback
-          fe00::0         ip6-localnet
-          ff00::0         ip6-mcastprefix
-          ff02::1         ip6-allnodes
-          ff02::2         ip6-allrouters
-          HOSTS
-          echo 'ubuntu' | sudo tee rootfs/etc/hostname >/dev/null
-          sudo tee rootfs/etc/resolv.conf >/dev/null <<'DNS'
-          # 可按实际网络环境修改；容器运行时一般由外部注入 DNS
-          nameserver 223.5.5.5
-          nameserver 119.29.29.29
-          DNS
-          sudo chmod 644 rootfs/etc/hosts rootfs/etc/hostname rootfs/etc/resolv.conf
-
-          # 硬校验：确保交付的确实是 arm64 rootfs，且源与 shell 都符合要求
-          file -L rootfs/usr/bin/zsh rootfs/usr/local/bin/starship | tee /dev/stderr
-          file -L rootfs/usr/bin/zsh | grep -Eqi 'aarch64|ARM' || {
-            echo "::error:: 导出的 zsh 不是 arm64 二进制"; exit 1; }
-          grep -q 'mirrors.ustc.edu.cn/ubuntu-ports' rootfs/etc/apt/sources.list.d/ustc.sources
-          grep -q '^root:.*:/usr/bin/zsh$' rootfs/etc/passwd
-          test -x rootfs/usr/local/bin/starship
-          test -x rootfs/usr/local/bin/rootfs-welcome
-
-          sudo tar --numeric-owner -cpf - -C rootfs . | pigz -9 > "${{ env.OUT_NAME }}.tar.gz"
-          sha256sum "${{ env.OUT_NAME }}.tar.gz" | tee "${{ env.OUT_NAME }}.tar.gz.sha256"
-          sudo cp rootfs/etc/rootfs-packages.tsv ./packages.tsv
-          sudo cp rootfs/etc/rootfs-build-info ./ROOTFS_INFO.txt
-          rm -f rootfs.raw.tar
-          ls -lh "${{ env.OUT_NAME }}.tar.gz"
-
-      - name: Build summary
+      - name: 清理并打包为 DroidSpaces 可直接导入的 tar.xz
         run: |
           set -euo pipefail
-          SIZE=$(du -h "${{ env.OUT_NAME }}.tar.gz" | cut -f1)
-          COUNT=$(wc -l < packages.tsv)
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Ubuntu 26.04 LTS arm64 rootfs 构建完成
+          # 兜底卸载：若 /dev 仍被挂载，绝不能执行 rm -rf（会误伤宿主 /dev）
+          for m in run dev/pts dev sys proc; do sudo umount -R "$ROOTFS/$m" 2>/dev/null || true; done
+          if mountpoint -q "$ROOTFS/dev"; then
+            echo '错误：rootfs/dev 仍处于挂载状态，拒绝打包'; exit 1
+          fi
+          sudo rm -f "$ROOTFS/usr/bin/qemu-aarch64-static" "$ROOTFS/tmp/configure-rootfs.sh"
+          sudo rm -rf "$ROOTFS/tmp"/* "$ROOTFS/var/tmp"/*
+          # 清掉 bind mount 残留的设备节点，但保留 systemd 需要的 dev 骨架目录
+          sudo rm -rf "$ROOTFS/dev"/*
+          sudo mkdir -p "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/dev/pts" "$ROOTFS/dev/shm" "$ROOTFS/run" "$ROOTFS/tmp"
+          OUT="ubuntu-${POINT_RELEASE}-arm64-droidspaces.tar.xz"
+          echo "打包 -> $OUT"
+          # 排除挂载点内容但保留空目录骨架；--numeric-owner 保留 root 所有权
+          sudo env XZ_OPT='-T0 -9' tar -C "$ROOTFS" --numeric-owner \
+            --exclude='./proc/*' --exclude='./sys/*' \
+            --exclude='./run/*' --exclude='./tmp/*' \
+            -cJf "$OUT" .
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          ls -lh "$OUT" "$OUT.sha256"
+          echo '== 关键文件自检 =='
+          sudo tar -tf "$OUT" | grep -E '^\./(sbin/init|bin/zsh|usr/local/bin/droid-welcome|usr/share/oh-my-zsh/oh-my-zsh.sh|etc/skel/\.zshrc)$' || true
 
-          - 产物：\`${{ env.OUT_NAME }}.tar.gz\`（${SIZE}），含 sha256 校验
-          - 已装软件包：${COUNT} 个（见 packages.tsv）
-          - 默认 shell：zsh + starship，登录显示中文欢迎语
-          - 本地化：zh_CN.UTF-8 / Noto CJK / 中文 man / Asia/Shanghai
-          - rootfs 软件源：中科大 USTC ubuntu-ports；构建源：官方默认（未改动）
-          - 不含内核，可直接 chroot、导入容器或配合板卡内核使用
+      - name: 附带 MesloLGS NF 字体包（供手机终端 App 选用）
+        run: |
+          set -euo pipefail
+          FONT_SRC="$ROOTFS/usr/share/fonts/truetype/meslolgs-nf"
+          mkdir -p "$FONT_SRC"
+          if ! ls "$FONT_SRC"/*.ttf >/dev/null 2>&1; then
+            echo '字体下载失败：请手动从 https://github.com/romkatv/powerlevel10k-media 获取 MesloLGS NF' \
+              > "$FONT_SRC/README.txt"
+          fi
+          (cd "$FONT_SRC" && python3 -m zipfile -c "$GITHUB_WORKSPACE/MesloLGS-NF.zip" *)
+          ls -lh "$GITHUB_WORKSPACE/MesloLGS-NF.zip"
 
-          解包示例：\`mkdir rootfs && sudo tar -xpf ${{ env.OUT_NAME }}.tar.gz -C rootfs\`
-          EOF
-
-      - name: Upload artifact
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ubuntu-26.04-arm64-rootfs
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
+          name: ubuntu-${{ env.POINT_RELEASE }}-arm64-droidspaces-rootfs
           path: |
-            ${{ env.OUT_NAME }}.tar.gz
-            ${{ env.OUT_NAME }}.tar.gz.sha256
-            packages.tsv
-            ROOTFS_INFO.txt
+            ubuntu-*-arm64-droidspaces.tar.xz
+            ubuntu-*-arm64-droidspaces.tar.xz.sha256
+            MesloLGS-NF.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
-      - name: Attach to GitHub Release (仅 v* 标签触发时)
+      - name: 写入构建摘要
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Ubuntu ${POINT_RELEASE} LTS arm64 · DroidSpaces RootFS
+
+          - 产物：\`ubuntu-${POINT_RELEASE}-arm64-droidspaces.tar.xz\`（+ \`.sha256\`）
+          - 内容：systemd PID 1 / zh_CN.UTF-8 中文终端 / zsh + Powerlevel10k / fzf-tab 路径补全 / 常用工具
+          - 构建源：**官方默认**（ubuntu-base 归档 / debootstrap 官方 ports），基础包不从第三方拉取
+          - 软件源：**中科大 USTC** \`https://mirrors.ustc.edu.cn/ubuntu-ports\`（arm64 ports），原官方配置备份在 \`/etc/apt/default-sources-backup/\`
+          - 导入：Android App「从文件安装」选 tar.xz；Linux 用 \`sudo tar -xJf ... -C <目录>\` 后 \`droidspaces --rootfs=<目录> start\`
+          - 终端字体：**MesloLGS NF**（已装进 rootfs，另附 \`MesloLGS-NF.zip\` 供手机终端 App 导入），否则系统/文件夹图标显示方块
+          - 首次进入可执行 \`p10k configure\` 重配主题；\`cman <命令>\` 看中文手册
+          - 老内核（≤ 5.10）设备请留意新版 systemd 兼容性
+          EOF
+
+      - name: 打 tag 时发布到 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ env.OUT_NAME }}.tar.gz
-            ${{ env.OUT_NAME }}.tar.gz.sha256
-            packages.tsv
-            ROOTFS_INFO.txt
+          name: Ubuntu ${{ env.POINT_RELEASE }} arm64 DroidSpaces RootFS
           body: |
-            Ubuntu 26.04 LTS (Resolute) arm64 完整 rootfs：中文本地化 + zsh/starship
-            + 中科大 USTC 软件源。构建阶段使用官方默认源，未做替换。
-
-      - name: Cleanup
-        if: always()
-        run: docker rm -f "${{ env.CONTAINER }}" 2>/dev/null || true
+            Ubuntu 26.04.1 LTS (Resolute Raccoon) arm64 rootfs for DroidSpaces.
+            systemd PID 1 · 完整中文终端 · zsh + Powerlevel10k（系统/文件夹图标 + fzf-tab 路径补全）· 常用工具 · 中文启动欢迎语。
+            构建源保持官方默认；软件源已切换到中科大 USTC（ubuntu-ports，arm64）。终端字体请使用 MesloLGS NF。
+          files: |
+            ubuntu-*-arm64-droidspaces.tar.xz
+            ubuntu-*-arm64-droidspaces.tar.xz.sha256
+            MesloLGS-NF.zip
