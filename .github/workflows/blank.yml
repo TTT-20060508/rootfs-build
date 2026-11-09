@@ -26,6 +26,8 @@
 #       否则 Nerd Font 图标与文件夹图标会显示成方块；`p10k configure` 可重配主题。
 #       若手机内核 <= 5.10，Ubuntu 26.04 自带的新版 systemd 可能不兼容，
 #       需要自行降级 systemd 或使用 DroidSpaces 的 systemd 兼容构建。
+#       构建宿主兼容 26.04：qemu-user-static 已是虚拟包，自动改用 qemu-user，
+#       并在 rootfs 内同时提供 qemu-aarch64 / qemu-aarch64-static 两个解释器名。
 # =============================================================================
 name: 构建 Ubuntu 26.04.1 arm64 DroidSpaces RootFS
 
@@ -79,24 +81,72 @@ jobs:
         with:
           platforms: arm64
 
-      - name: 安装构建工具
+      - name: 安装构建工具（兼容 26.04 qemu 拆包）
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            qemu-user-static binfmt-support debootstrap \
-            xz-utils tar coreutils curl git ca-certificates
-          # 宿主侧 binfmt 指向 /usr/bin/qemu-aarch64-static；后续会把它复制进 chroot，
-          # 因此无论 binfmt 是否带 F 标志，arm64 二进制都能在 chroot 内执行。
-          sudo update-binfmts --enable qemu-aarch64 || true
+          # Ubuntu 26.04/resolute 起 qemu-user-static 变成纯虚拟包，由
+          # qemu-user-binfmt / qemu-user-binfmt-hwe 提供，apt 拒绝自动选 provider：
+          #   E: Package 'qemu-user-static' has no installation candidate
+          # 实体静态二进制改由 qemu-user 提供，且文件名去掉 -static 后缀。
+          # 老发行版仍装 qemu-user-static（与 ubuntu-dev-tools 0.211 官方修复一致）。
+          # 不用管道 + grep -q：set -o pipefail 下 grep 提前退出会让 apt-cache 收到 SIGPIPE，
+          # 把 24.04 的真实包误判成虚拟包。先落盘再精确匹配。
+          apt-cache show qemu-user-static > /tmp/qemu-show.txt 2>/dev/null || true
+          if grep -q '^Package: qemu-user-static$' /tmp/qemu-show.txt; then
+            QEMU_PKG=qemu-user-static
+          else
+            QEMU_PKG=qemu-user
+          fi
+          echo "宿主 QEMU 包: $QEMU_PKG"
+          COMMON_PKGS="debootstrap xz-utils tar coreutils curl git ca-certificates"
+          sudo apt-get install -y --no-install-recommends "$QEMU_PKG" $COMMON_PKGS \
+            || sudo apt-get install -y --no-install-recommends \
+              qemu-user-binfmt $COMMON_PKGS
+          # binfmt-support 仅作可选兜底；binfmt 注册主要由 setup-qemu-action 完成
+          sudo apt-get install -y --no-install-recommends binfmt-support \
+            || echo '跳过 binfmt-support（setup-qemu-action 已注册 binfmt）'
+          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
           echo '== binfmt_misc 状态 =='
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
-          ls -l /usr/bin/qemu-aarch64-static
+          # 定位宿主 aarch64 解释器：26.04 是 /usr/bin/qemu-aarch64，
+          # 旧版是 /usr/bin/qemu-aarch64-static，均为 amd64 静态二进制。
+          QEMU_SRC=""
+          for c in /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64 \
+                   /usr/libexec/qemu-binfmt/aarch64-binfmt-P; do
+            [ -x "$c" ] || continue
+            if ! command -v file >/dev/null 2>&1; then
+              QEMU_SRC="$c"; break
+            fi
+            QEMU_FILE=$(file -b "$c" 2>/dev/null || true)
+            case "$QEMU_FILE" in
+              *ELF*) QEMU_SRC="$c"; break ;;
+            esac
+          done
+          [ -n "$QEMU_SRC" ] || {
+            echo '错误：未找到宿主 qemu-aarch64 解释器'
+            ls -l /usr/bin/qemu-aarch64* 2>/dev/null || true
+            exit 1
+          }
+          echo "QEMU_SRC=$QEMU_SRC" >> "$GITHUB_ENV"
+          echo "宿主解释器: $QEMU_SRC"
+          file "$QEMU_SRC" 2>/dev/null || true
 
       - name: 获取官方 Ubuntu Base 26.04.1 arm64（或 debootstrap 现场构建）
         run: |
           set -euo pipefail
           mkdir -p "$ROOTFS"
+          # 把宿主 amd64 静态 qemu 注入 rootfs，同时提供带/不带 -static 两个名字：
+          # 26.04 的 qemu-user-binfmt 注册裸名 /usr/bin/qemu-aarch64，旧版注册 -static。
+          # .qemu-injected 记录本次注入项，打包前精确清理，不误删 rootfs 原生文件。
+          copy_qemu() {
+            for n in qemu-aarch64 qemu-aarch64-static; do
+              if [ ! -e "$ROOTFS/usr/bin/$n" ]; then
+                sudo install -m 755 "$QEMU_SRC" "$ROOTFS/usr/bin/$n"
+                echo "$n" >> "$ROOTFS/.qemu-injected"
+              fi
+            done
+          }
           if [ "$BASE_METHOD" = "debootstrap" ]; then
             # runner 上的 debootstrap 可能还不认识 resolute，借用已有的 Ubuntu 脚本
             if [ ! -e /usr/share/debootstrap/scripts/resolute ]; then
@@ -112,7 +162,7 @@ jobs:
               --components=main,restricted,universe,multiverse \
               --include=ca-certificates,apt,locales,sudo \
               "$SUITE" "$ROOTFS" http://ports.ubuntu.com/ubuntu-ports/
-            sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS/usr/bin/"
+            copy_qemu
             sudo mount -t proc proc "$ROOTFS/proc"
             sudo mount -t sysfs sys "$ROOTFS/sys"
             sudo mount --bind /dev "$ROOTFS/dev"
@@ -129,7 +179,7 @@ jobs:
             # 必须 sudo 解包：保留 root 所有权与 setuid 位
             sudo tar -xzf "$FILE" -C "$ROOTFS" --numeric-owner
           fi
-          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS/usr/bin/"
+          copy_qemu
           # 构建期 DNS：不复制宿主的 systemd-resolved stub（127.0.0.53 在 chroot 内不可用）。
           # 首选国内公共 DNS，便于 chroot 内解析 mirrors.ustc.edu.cn；DroidSpaces 启动时
           # 通常会注入自己的 resolv.conf，这里保留一份通用默认值。
@@ -567,6 +617,11 @@ jobs:
           sudo mount --bind /dev "$ROOTFS/dev"
           sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
           sudo mount -t tmpfs tmpfs "$ROOTFS/run"
+          echo '== 验证 arm64 chroot 可执行（binfmt + qemu 解释器生效）=='
+          sudo chroot "$ROOTFS" /bin/true || {
+            echo '错误：arm64 二进制无法在 chroot 内执行，请检查 binfmt 注册与 QEMU_SRC'
+            exit 1
+          }
           sudo install -m 755 "$RUNNER_TEMP/configure-rootfs.sh" "$ROOTFS/tmp/configure-rootfs.sh"
           sudo env \
             DEBIAN_FRONTEND=noninteractive \
@@ -585,7 +640,14 @@ jobs:
           if mountpoint -q "$ROOTFS/dev"; then
             echo '错误：rootfs/dev 仍处于挂载状态，拒绝打包'; exit 1
           fi
-          sudo rm -f "$ROOTFS/usr/bin/qemu-aarch64-static" "$ROOTFS/tmp/configure-rootfs.sh"
+          if [ -f "$ROOTFS/.qemu-injected" ]; then
+            while read -r n; do
+              [ -n "$n" ] || continue
+              sudo rm -f "$ROOTFS/usr/bin/$n"
+            done < "$ROOTFS/.qemu-injected"
+            sudo rm -f "$ROOTFS/.qemu-injected"
+          fi
+          sudo rm -f "$ROOTFS/tmp/configure-rootfs.sh"
           sudo rm -rf "$ROOTFS/tmp"/* "$ROOTFS/var/tmp"/*
           # 清掉 bind mount 残留的设备节点，但保留 systemd 需要的 dev 骨架目录
           sudo rm -rf "$ROOTFS/dev"/*
